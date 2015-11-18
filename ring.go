@@ -7,11 +7,16 @@ import (
 	"sync"
 	"time"
 
-	"gopkg.in/redis.v3/internal/consistenthash"
+	"github.com/codeb2cc/redis/internal/consistenthash"
 )
 
 var (
 	errRingShardsDown = errors.New("redis: all ring shards are down")
+)
+
+const (
+	DefaultRingReplicas = 100
+	ShardDownThreshold  = 5
 )
 
 // RingOptions are used to configure a ring client and should be
@@ -34,6 +39,9 @@ type RingOptions struct {
 	PoolSize    int
 	PoolTimeout time.Duration
 	IdleTimeout time.Duration
+
+	NReplicas int
+	Hasher    consistenthash.Hash
 }
 
 func (opt *RingOptions) clientOptions() *Options {
@@ -67,8 +75,7 @@ func (shard *ringShard) String() string {
 }
 
 func (shard *ringShard) IsDown() bool {
-	const threshold = 5
-	return shard.down >= threshold
+	return shard.down >= ShardDownThreshold
 }
 
 func (shard *ringShard) IsUp() bool {
@@ -110,6 +117,7 @@ type Ring struct {
 
 	opt       *RingOptions
 	nreplicas int
+	hasher    consistenthash.Hash
 
 	mx     sync.RWMutex
 	hash   *consistenthash.Map
@@ -119,15 +127,21 @@ type Ring struct {
 }
 
 func NewRing(opt *RingOptions) *Ring {
-	const nreplicas = 100
 	ring := &Ring{
 		opt:       opt,
-		nreplicas: nreplicas,
-
-		hash:   consistenthash.New(nreplicas, nil),
-		shards: make(map[string]*ringShard),
+		nreplicas: DefaultRingReplicas,
+		shards:    make(map[string]*ringShard),
 	}
 	ring.commandable.process = ring.process
+
+	if opt.NReplicas != 0 {
+		ring.nreplicas = opt.NReplicas
+	}
+	if opt.Hasher != nil {
+		ring.hasher = opt.Hasher
+	}
+	ring.hash = consistenthash.New(ring.nreplicas, ring.hasher)
+
 	for name, addr := range opt.Addrs {
 		clopt := opt.clientOptions()
 		clopt.Addr = addr
@@ -176,7 +190,7 @@ func (ring *Ring) rebalance() {
 	defer ring.mx.Unlock()
 	ring.mx.Lock()
 
-	ring.hash = consistenthash.New(ring.nreplicas, nil)
+	ring.hash = consistenthash.New(ring.nreplicas, ring.hasher)
 	for name, shard := range ring.shards {
 		if shard.IsUp() {
 			ring.hash.Add(name)
